@@ -1,0 +1,27 @@
+{
+  "name": "temp-mail-cloudflare",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Production-ready Cloudflare Temp Mail Worker using KV, D1, Durable Objects and WebSockets.",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:dry": "wrangler deploy --dry-run",
+    "types": "wrangler types",
+    "check": "wrangler types && wrangler deploy --dry-run",
+    "tail": "wrangler tail",
+    "d1:list": "wrangler d1 list",
+    "d1:info": "wrangler d1 info temp_mail_db",
+    "d1:query": "wrangler d1 execute temp_mail_db --remote",
+    "kv:list": "wrangler kv namespace list",
+    "cf:publish": "wrangler deploy",
+    "cf:version": "wrangler versions upload"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
