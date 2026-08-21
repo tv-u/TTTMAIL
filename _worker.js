@@ -298,6 +298,35 @@ renderFeatures(FEATURES);generateNewEmail();fetchInbox();startPolling();
 </body>
 </html>`;
 
+async function sendOtpEmail(env, to, code) {
+  if (!env.RESEND_API_KEY) {
+    return { ok: false, provider: "none", message: "RESEND_API_KEY missing" };
+  }
+
+  const from = env.MAIL_FROM || "TTTMAIL <no-reply@yourdomain.com>";
+  const response = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.RESEND_API_KEY}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      from,
+      to,
+      subject: "Your OTP code",
+      html: `<div style="font-family:Arial,sans-serif">
+        <h2>Your OTP code</h2>
+        <p style="font-size:28px;font-weight:800;letter-spacing:4px">${code}</p>
+        <p>This code expires in 10 minutes.</p>
+      </div>`,
+      text: `Your OTP code is ${code}. It expires in 10 minutes.`
+    })
+  });
+
+  const details = await response.text().catch(() => "");
+  return { ok: response.ok, status: response.status, details, provider: "resend" };
+}
+
 async function handleApi(request, env, url) {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
@@ -307,7 +336,7 @@ async function handleApi(request, env, url) {
       service: "tttmail-worker",
       time: new Date().toISOString(),
       kv: !!env.TTTMAIL_KV,
-      cron: true
+      resend: !!env.RESEND_API_KEY
     });
   }
 
@@ -351,38 +380,63 @@ async function handleApi(request, env, url) {
 
   if (url.pathname === "/api/otp/request") {
     if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
-    const body = await request.json().catch(() => ({}));
-    const email = String(body.email || "").trim().toLowerCase();
-    if (!email) return json({ ok: false, error: "email required" }, 400);
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-    const codeHash = await sha256Base64(`${email}:${code}:${env.OTP_PEPPER || "dev-pepper"}`);
-    const record = { email, codeHash, expiresAt: Date.now() + 600000 };
-    if (env.TTTMAIL_KV) await env.TTTMAIL_KV.put(`otp:${email}`, JSON.stringify(record), { expirationTtl: 600 });
-    if (env.RESEND_API_KEY) {
-      await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { authorization: `Bearer ${env.RESEND_API_KEY}`, "content-type": "application/json" },
-        body: JSON.stringify({ from: env.MAIL_FROM, to: email, subject: "Your OTP code", text: `Your OTP code is ${code}. It expires in 10 minutes.` })
-      });
+    let body = {};
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, error: "Invalid JSON body" }, 400);
     }
-    return json({ ok: true, email, message: "OTP generated", delivery: env.RESEND_API_KEY ? "sent" : "stored" });
+
+    const email = String(body.email || "").trim().toLowerCase();
+    if (!email || !email.includes("@")) return json({ ok: false, error: "Valid email required" }, 400);
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const pepper = env.OTP_PEPPER || "change-this-in-production";
+    const codeHash = await sha256Base64(`${email}:${code}:${pepper}`);
+
+    const record = { email, codeHash, expiresAt: Date.now() + 10 * 60 * 1000 };
+    if (env.TTTMAIL_KV) await env.TTTMAIL_KV.put(`otp:${email}`, JSON.stringify(record), { expirationTtl: 600 });
+
+    const sent = await sendOtpEmail(env, email, code);
+
+    if (!sent.ok) {
+      return json({
+        ok: false,
+        error: "OTP send failed",
+        provider: sent.provider,
+        status: sent.status || 500,
+        details: sent.details || sent.message || "Unknown error"
+      }, 502);
+    }
+
+    return json({ ok: true, email, delivery: "sent", message: "OTP sent successfully" });
   }
 
   if (url.pathname === "/api/otp/verify") {
     if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
-    const body = await request.json().catch(() => ({}));
+    let body = {};
+    try {
+      body = await request.json();
+    } catch {
+      return json({ ok: false, error: "Invalid JSON body" }, 400);
+    }
+
     const email = String(body.email || "").trim().toLowerCase();
     const code = String(body.code || "").trim();
     if (!email || !code) return json({ ok: false, error: "email and code required" }, 400);
+
     const stored = env.TTTMAIL_KV ? await env.TTTMAIL_KV.get(`otp:${email}`) : null;
     if (!stored) return json({ ok: false, verified: false, message: "OTP not found or expired" }, 404);
+
     const record = JSON.parse(stored);
     if (Date.now() > record.expiresAt) {
       await env.TTTMAIL_KV.delete(`otp:${email}`);
       return json({ ok: false, verified: false, message: "OTP expired" }, 400);
     }
-    const checkHash = await sha256Base64(`${email}:${code}:${env.OTP_PEPPER || "dev-pepper"}`);
+
+    const checkHash = await sha256Base64(`${email}:${code}:${env.OTP_PEPPER || "change-this-in-production"}`);
     if (checkHash !== record.codeHash) return json({ ok: false, verified: false, message: "Invalid OTP" }, 401);
+
     await env.TTTMAIL_KV.delete(`otp:${email}`);
     return json({ ok: true, verified: true, message: "OTP verified" });
   }
@@ -395,11 +449,33 @@ async function handleApi(request, env, url) {
   }
 
   if (url.pathname === "/api/analytics") {
-    return json({ ok: true, stats: { uptime: "99.9%", edgeLatencyMs: 18, featureCount: FEATURE_LIST.length, time: new Date().toISOString() } });
+    return json({
+      ok: true,
+      stats: {
+        uptime: "99.9%",
+        edgeLatencyMs: 18,
+        featureCount: FEATURE_LIST.length,
+        time: new Date().toISOString()
+      }
+    });
   }
 
   if (url.pathname === "/api/routes") {
-    return json({ ok: true, routes: ["/api/health", "/api/features", "/api/mailbox/new", "/api/mailbox/get", "/api/inbox", "/api/message", "/api/otp/request", "/api/otp/verify", "/api/alias/generate", "/api/analytics"] });
+    return json({
+      ok: true,
+      routes: [
+        "/api/health",
+        "/api/features",
+        "/api/mailbox/new",
+        "/api/mailbox/get",
+        "/api/inbox",
+        "/api/message",
+        "/api/otp/request",
+        "/api/otp/verify",
+        "/api/alias/generate",
+        "/api/analytics"
+      ]
+    });
   }
 
   return json({ ok: false, error: "Not found" }, 404);
