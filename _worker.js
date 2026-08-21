@@ -1,495 +1,3071 @@
-const FEATURE_LIST = Array.from({ length: 100 }, (_, i) => ({
-  id: i + 1,
-  title: `Utility ${i + 1}`,
-  description: `Production utility module ${i + 1} for email, security, otp, alias, or analytics workflows.`,
-  category: ["mail", "security", "otp", "alias", "analytics"][i % 5],
-  icon: ["fa-envelope", "fa-shield-halved", "fa-filter", "fa-bolt", "fa-link"][i % 5]
-}));
+// ============================================================
+// TTTMAIL — ENTERPRISE CLOUDFLARE WORKER
+// Version: 5.0.0
+// Runtime: Cloudflare Workers
+// KV Binding: MY_KV
+//
+// Required KV keys:
+//   html_main
+//   ad_top
+//   ad_middle
+//   ad_bottom
+//
+// API routes:
+//   GET /api/health
+//   GET /api/ads
+//   GET /api/inbox?login=...&domain=...
+//   GET /api/message?login=...&domain=...&id=...
+//
+// External provider:
+//   1secmail API
+//
+// IMPORTANT:
+// - No simulated emails.
+// - No simulated OTPs.
+// - OTP extraction is performed only against received messages.
+// - Verification URLs are extracted only from received messages.
+// ============================================================
 
-function corsHeaders() {
+const VERSION = "5.0.0";
+
+const CONFIG = Object.freeze({
+  KV_HTML_KEY: "html_main",
+
+  MAIL_API: "https://www.1secmail.com/api/v1/",
+
+  REQUEST_TIMEOUT_MS: 12000,
+
+  MAX_LOGIN_LENGTH: 64,
+  MAX_DOMAIN_LENGTH: 128,
+  MAX_MESSAGE_ID_LENGTH: 64,
+
+  HTML_CACHE_SECONDS: 60,
+  API_CACHE_SECONDS: 0,
+
+  ALLOWED_METHODS: ["GET", "HEAD", "OPTIONS"],
+
+  ALLOWED_DOMAINS: new Set([
+    "1secmail.com",
+    "1secmail.org",
+    "1secmail.net",
+    "esiix.com",
+    "wwjmp.com"
+  ])
+});
+
+// ============================================================
+// SECURITY HEADERS
+// ============================================================
+
+function securityHeaders(extra = {}) {
   return {
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type,authorization",
-    "access-control-max-age": "86400"
+    "Content-Security-Policy": [
+      "default-src 'self'",
+      "base-uri 'self'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+      "object-src 'none'",
+      "img-src 'self' data: https:",
+      "font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com",
+      "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com",
+      "connect-src 'self'",
+      "worker-src 'self'",
+      "manifest-src 'self'",
+      "upgrade-insecure-requests"
+    ].join("; "),
+
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+
+    "X-Content-Type-Options": "nosniff",
+
+    "X-Frame-Options": "DENY",
+
+    "Permissions-Policy": [
+      "camera=()",
+      "microphone=()",
+      "geolocation=()",
+      "payment=()",
+      "usb=()",
+      "bluetooth=()"
+    ].join(", "),
+
+    "Cross-Origin-Opener-Policy": "same-origin",
+
+    "Cross-Origin-Resource-Policy": "same-origin",
+
+    "Strict-Transport-Security":
+      "max-age=31536000; includeSubDomains",
+
+    ...extra
   };
 }
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
+// ============================================================
+// RESPONSE HELPERS
+// ============================================================
+
+function jsonResponse(data, status = 200, extra = {}) {
+  return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-      ...corsHeaders()
-    }
+    headers: securityHeaders({
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...extra
+    })
   });
 }
 
-function html(body, status = 200) {
-  return new Response(body, {
+function htmlResponse(html, status = 200) {
+  return new Response(html, {
     status,
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "no-store"
-    }
+    headers: securityHeaders({
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control":
+        `public, max-age=${CONFIG.HTML_CACHE_SECONDS}, must-revalidate`
+    })
   });
 }
 
-function randomString(len = 10) {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const bytes = new Uint8Array(len);
-  crypto.getRandomValues(bytes);
-  return Array.from(bytes, b => chars[b % chars.length]).join("");
+function errorResponse(status, code, message) {
+  return jsonResponse(
+    {
+      ok: false,
+      error: code,
+      message,
+      version: VERSION
+    },
+    status
+  );
 }
 
-async function sha256Base64(input) {
-  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
-  return btoa(String.fromCharCode(...new Uint8Array(hash)));
+// ============================================================
+// INPUT VALIDATION
+// ============================================================
+
+function isValidLogin(login) {
+  if (
+    typeof login !== "string" ||
+    !login ||
+    login.length > CONFIG.MAX_LOGIN_LENGTH
+  ) {
+    return false;
+  }
+
+  return /^[a-zA-Z0-9._-]+$/.test(login);
 }
 
-function makeMailbox(domain = "1secmail.com") {
-  const login = randomString(10);
+function isValidDomain(domain) {
+  if (
+    typeof domain !== "string" ||
+    !domain ||
+    domain.length > CONFIG.MAX_DOMAIN_LENGTH
+  ) {
+    return false;
+  }
+
+  return CONFIG.ALLOWED_DOMAINS.has(domain.toLowerCase());
+}
+
+function isValidMessageId(id) {
+  if (
+    typeof id !== "string" ||
+    !id ||
+    id.length > CONFIG.MAX_MESSAGE_ID_LENGTH
+  ) {
+    return false;
+  }
+
+  return /^\d+$/.test(id);
+}
+
+// ============================================================
+// TIMEOUT / UPSTREAM FETCH
+// ============================================================
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = CONFIG.REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+
+  const timer = setTimeout(() => {
+    controller.abort("upstream-timeout");
+  }, timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ============================================================
+// 1SECMAIL UPSTREAM REQUEST
+// ============================================================
+
+async function mailApiRequest(params) {
+  const url = new URL(CONFIG.MAIL_API);
+
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, String(value));
+  }
+
+  const response = await fetchWithTimeout(
+    url.toString(),
+    {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "TTTMAIL-Cloudflare-Worker/5.0"
+      },
+      cf: {
+        cacheTtl: 0,
+        cacheEverything: false
+      }
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`MAIL_PROVIDER_HTTP_${response.status}`);
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+
+  if (!contentType.toLowerCase().includes("json")) {
+    throw new Error("MAIL_PROVIDER_INVALID_CONTENT_TYPE");
+  }
+
+  const data = await response.json();
+
+  return data;
+}
+
+// ============================================================
+// NORMALIZE INBOX
+// ============================================================
+
+function normalizeInbox(data) {
+  if (!Array.isArray(data)) {
+    throw new Error("INVALID_INBOX_RESPONSE");
+  }
+
+  return data
+    .filter(item => item && item.id != null)
+    .slice(0, 50)
+    .map(item => ({
+      id: String(item.id),
+      from: typeof item.from === "string" ? item.from.slice(0, 500) : "",
+      subject:
+        typeof item.subject === "string"
+          ? item.subject.slice(0, 1000)
+          : "",
+      date:
+        typeof item.date === "string"
+          ? item.date.slice(0, 200)
+          : ""
+    }));
+}
+
+// ============================================================
+// NORMALIZE MESSAGE
+// ============================================================
+
+function normalizeMessage(data) {
+  if (!data || typeof data !== "object") {
+    throw new Error("INVALID_MESSAGE_RESPONSE");
+  }
+
   return {
-    login,
-    domain,
-    address: `${login}@${domain}`,
-    createdAt: new Date().toISOString()
+    id: data.id != null ? String(data.id) : "",
+    from:
+      typeof data.from === "string"
+        ? data.from.slice(0, 1000)
+        : "",
+    subject:
+      typeof data.subject === "string"
+        ? data.subject.slice(0, 2000)
+        : "",
+    date:
+      typeof data.date === "string"
+        ? data.date.slice(0, 300)
+        : "",
+    textBody:
+      typeof data.textBody === "string"
+        ? data.textBody.slice(0, 200000)
+        : "",
+    body:
+      typeof data.body === "string"
+        ? data.body.slice(0, 200000)
+        : "",
+    htmlBody:
+      typeof data.htmlBody === "string"
+        ? data.htmlBody.slice(0, 300000)
+        : ""
   };
 }
 
-const APP_HTML = `<!DOCTYPE html>
+// ============================================================
+// API ROUTE — HEALTH
+// ============================================================
+
+async function handleHealth(env) {
+  let kvAvailable = false;
+
+  try {
+    if (env.MY_KV) {
+      await env.MY_KV.get(CONFIG.KV_HTML_KEY, {
+        type: "text"
+      });
+      kvAvailable = true;
+    }
+  } catch {
+    kvAvailable = false;
+  }
+
+  return jsonResponse({
+    ok: true,
+    service: "TTTMAIL",
+    version: VERSION,
+    runtime: "Cloudflare Workers",
+    kv: kvAvailable,
+    timestamp: new Date().toISOString()
+  });
+}
+
+// ============================================================
+// API ROUTE — ADS
+// ============================================================
+
+async function handleAds(env) {
+  if (!env.MY_KV) {
+    return jsonResponse({
+      ok: true,
+      top: "",
+      middle: "",
+      bottom: ""
+    });
+  }
+
+  try {
+    const [top, middle, bottom] = await Promise.all([
+      env.MY_KV.get("ad_top", { type: "text" }),
+      env.MY_KV.get("ad_middle", { type: "text" }),
+      env.MY_KV.get("ad_bottom", { type: "text" })
+    ]);
+
+    return jsonResponse(
+      {
+        ok: true,
+        top: top || "",
+        middle: middle || "",
+        bottom: bottom || ""
+      },
+      200,
+      {
+        "Cache-Control": "public, max-age=60, stale-while-revalidate=300"
+      }
+    );
+  } catch (error) {
+    console.error("ADS_KV_ERROR", error);
+
+    return jsonResponse(
+      {
+        ok: false,
+        top: "",
+        middle: "",
+        bottom: "",
+        error: "ADS_UNAVAILABLE"
+      },
+      200
+    );
+  }
+}
+
+// ============================================================
+// API ROUTE — INBOX
+// ============================================================
+
+async function handleInbox(url) {
+  const login = url.searchParams.get("login") || "";
+  const domain = (url.searchParams.get("domain") || "").toLowerCase();
+
+  if (!isValidLogin(login)) {
+    return errorResponse(
+      400,
+      "INVALID_LOGIN",
+      "The mailbox login is invalid."
+    );
+  }
+
+  if (!isValidDomain(domain)) {
+    return errorResponse(
+      400,
+      "INVALID_DOMAIN",
+      "The requested mailbox domain is not supported."
+    );
+  }
+
+  try {
+    const result = await mailApiRequest({
+      action: "getMessages",
+      login,
+      domain
+    });
+
+    const messages = normalizeInbox(result);
+
+    return jsonResponse(
+      {
+        ok: true,
+        login,
+        domain,
+        count: messages.length,
+        messages
+      },
+      200,
+      {
+        "Cache-Control": "no-store"
+      }
+    );
+  } catch (error) {
+    console.error("INBOX_UPSTREAM_ERROR", error);
+
+    return errorResponse(
+      502,
+      "MAIL_PROVIDER_UNAVAILABLE",
+      "The temporary-mail provider could not be reached."
+    );
+  }
+}
+
+// ============================================================
+// API ROUTE — MESSAGE
+// ============================================================
+
+async function handleMessage(url) {
+  const login = url.searchParams.get("login") || "";
+  const domain = (url.searchParams.get("domain") || "").toLowerCase();
+  const id = url.searchParams.get("id") || "";
+
+  if (!isValidLogin(login)) {
+    return errorResponse(
+      400,
+      "INVALID_LOGIN",
+      "The mailbox login is invalid."
+    );
+  }
+
+  if (!isValidDomain(domain)) {
+    return errorResponse(
+      400,
+      "INVALID_DOMAIN",
+      "The requested mailbox domain is not supported."
+    );
+  }
+
+  if (!isValidMessageId(id)) {
+    return errorResponse(
+      400,
+      "INVALID_MESSAGE_ID",
+      "The message ID is invalid."
+    );
+  }
+
+  try {
+    const result = await mailApiRequest({
+      action: "readMessage",
+      login,
+      domain,
+      id
+    });
+
+    return jsonResponse(
+      {
+        ok: true,
+        message: normalizeMessage(result)
+      },
+      200,
+      {
+        "Cache-Control": "no-store"
+      }
+    );
+  } catch (error) {
+    console.error("MESSAGE_UPSTREAM_ERROR", error);
+
+    return errorResponse(
+      502,
+      "MAIL_MESSAGE_UNAVAILABLE",
+      "The requested email message could not be loaded."
+    );
+  }
+}
+
+// ============================================================
+// FALLBACK HTML
+// ============================================================
+
+function getDefaultHTML() {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>TTTMAIL</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css" />
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#08080a">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="index,follow,max-image-preview:large">
+<meta name="description" content="TTTMAIL — free temporary email with a real disposable inbox for receiving real verification emails and OTP messages.">
+<link rel="canonical" href="/">
+<link rel="manifest" href="/manifest.webmanifest">
+<title>TTTMAIL — Free Temporary Email & Real Inbox</title>
+
 <style>
-:root{--bg:#08080a;--card:#18181e;--surface:#121216;--border:#2a2a38;--text:#fff;--muted:#a0a0b0;--primary:#ff0080;--secondary:#00ff88;--accent:#ffdd00;--header-h:72px}
-*{box-sizing:border-box;margin:0;padding:0;font-family:Inter,system-ui,sans-serif}
-html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text)}
-body{position:relative}
-#bgCanvas{position:fixed;inset:0;width:100vw;height:100vh;z-index:-1;pointer-events:none}
-.scroll-container{height:100vh;overflow-y:auto;overflow-x:hidden;scroll-snap-type:y mandatory;scroll-behavior:smooth;scroll-padding-top:var(--header-h)}
-.section-viewport{min-height:100vh;scroll-snap-align:start;scroll-snap-stop:always;padding:calc(var(--header-h) + 20px) 16px 24px;display:flex;align-items:center;justify-content:center}
-.container{width:100%;max-width:980px}
-.header{position:fixed;top:0;left:0;right:0;height:var(--header-h);z-index:100;background:rgba(24,24,30,.94);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 16px}
-.brand{display:flex;align-items:center;gap:10px;text-decoration:none;color:var(--text);font-weight:900}
-.nav-links{display:none;gap:12px}
-@media(min-width:1200px){.nav-links{display:flex}}
-.nav-link{color:var(--muted);text-decoration:none;font-size:.78rem;font-weight:800;text-transform:uppercase;cursor:pointer}
-.nav-link.active,.nav-link:hover{color:var(--text)}
-.icon-btn,.pill,.btn,.input,.select,.card,.tile,.modal-content,.drawer{border:1px solid var(--border)}
-.icon-btn{width:36px;height:36px;border-radius:9999px;background:var(--surface);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer}
-.btn{padding:12px 16px;border-radius:9999px;background:linear-gradient(135deg,var(--primary),#c00060);color:#fff;font-weight:900;cursor:pointer}
-.btn.green{background:linear-gradient(135deg,var(--secondary),#00aa55);color:#050505}
-.btn.dark{background:linear-gradient(135deg,#22222e,#14141a);color:#fff}
-.row{display:flex;gap:12px;flex-wrap:wrap}
-.hero{text-align:center;margin-bottom:16px}
-.hero h1{font-size:2rem;line-height:1.1;margin:8px 0;font-weight:900}
-.hero p{max-width:660px;margin:0 auto;color:var(--muted);font-weight:600}
-.card{background:var(--card);border-radius:22px;padding:22px;box-shadow:0 12px 35px rgba(0,0,0,.45)}
-.input,.select{width:100%;background:var(--surface);color:var(--text);border-radius:12px;padding:12px 14px;font-weight:700;outline:none}
-.email-box{width:100%;background:var(--surface);border:2px solid var(--primary);border-radius:16px;padding:18px;text-align:center;font-weight:900;font-size:1.2rem;cursor:pointer;overflow-x:auto;white-space:nowrap}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px;max-height:48vh;overflow:auto;padding-right:4px}
-.tile{background:var(--surface);border-radius:14px;padding:14px;cursor:pointer}
-.tile:hover{transform:translateY(-2px);border-color:var(--primary)}
-.dotbar{position:fixed;right:20px;top:50%;transform:translateY(-50%);z-index:1000;display:flex;flex-direction:column;gap:12px}
-.dot{width:12px;height:12px;border-radius:9999px;background:var(--border);cursor:pointer}
-.dot.active{background:var(--primary);box-shadow:0 0 12px var(--primary);transform:scale(1.3)}
-@media(max-width:768px){.dotbar{display:none}}
-.drawer-overlay,.modal-overlay{position:fixed;inset:0;display:none}
-.drawer-overlay{background:rgba(0,0,0,.7);z-index:1500}
-.drawer{position:fixed;top:0;right:-100%;width:85%;max-width:340px;height:100vh;background:var(--card);z-index:2000;padding:20px;transition:right .3s ease;overflow:auto}
-.drawer.open{right:0}
-.modal-overlay{background:rgba(0,0,0,.85);backdrop-filter:blur(8px);z-index:3000;align-items:center;justify-content:center;padding:16px}
-.modal-content{width:100%;max-width:720px;max-height:85vh;overflow:auto;background:var(--card);border-radius:22px;padding:24px;position:relative}
-.close{position:absolute;top:16px;right:16px;width:36px;height:36px;border-radius:9999px;background:var(--surface);display:flex;align-items:center;justify-content:center;cursor:pointer}
-.toast{position:fixed;left:16px;right:16px;bottom:20px;max-width:460px;margin:0 auto;background:#121216;border:1px solid var(--secondary);border-radius:16px;padding:14px 18px;z-index:4000;transform:translateY(160%);transition:transform .25s ease}
-.toast.show{transform:translateY(0)}
-small,.muted{color:var(--muted)}
-pre{white-space:pre-wrap;word-break:break-word;background:var(--surface);padding:14px;border-radius:12px;overflow:auto}
-.pill{display:inline-flex;align-items:center;gap:6px;background:var(--surface);padding:6px 12px;border-radius:9999px;color:var(--muted);font-size:.72rem;font-weight:800;text-transform:uppercase}
+:root{
+  --pink:#ff0080;
+  --pink2:#c80062;
+  --green:#00ff88;
+  --green2:#00a85a;
+  --yellow:#ffdd00;
+  --bg:#08080a;
+  --surface:#111116;
+  --surface2:#18181f;
+  --border:#2b2b37;
+  --text:#fff;
+  --muted:#9b9baa;
+  --danger:#ff4567;
+  --radius:18px;
+  --pill:999px;
+  --shadow:0 15px 50px rgba(0,0,0,.45);
+  --transition:180ms cubic-bezier(.2,.8,.2,1);
+}
+
+*{
+  box-sizing:border-box;
+  margin:0;
+  padding:0;
+}
+
+html{
+  background:var(--bg);
+  scroll-behavior:smooth;
+}
+
+body{
+  min-height:100vh;
+  background:
+    radial-gradient(circle at 10% 0%,rgba(255,0,128,.08),transparent 30rem),
+    radial-gradient(circle at 90% 20%,rgba(0,255,136,.05),transparent 30rem),
+    var(--bg);
+  color:var(--text);
+  font-family:
+    Inter,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  overflow-x:hidden;
+}
+
+button,
+input,
+select{
+  font:inherit;
+}
+
+button,
+a{
+  -webkit-tap-highlight-color:transparent;
+}
+
+button{
+  cursor:pointer;
+}
+
+a{
+  color:inherit;
+  text-decoration:none;
+}
+
+::selection{
+  background:var(--pink);
+  color:#fff;
+}
+
+.gradient{
+  background:
+    linear-gradient(
+      135deg,
+      var(--pink),
+      var(--yellow),
+      var(--green)
+    );
+  -webkit-background-clip:text;
+  background-clip:text;
+  color:transparent;
+}
+
+.sr-only{
+  position:absolute!important;
+  width:1px!important;
+  height:1px!important;
+  padding:0!important;
+  margin:-1px!important;
+  overflow:hidden!important;
+  clip:rect(0,0,0,0)!important;
+  white-space:nowrap!important;
+  border:0!important;
+}
+
+.header{
+  position:sticky;
+  top:0;
+  z-index:1000;
+  min-height:64px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  padding:10px 14px;
+  background:rgba(8,8,10,.9);
+  border-bottom:1px solid rgba(255,255,255,.08);
+  backdrop-filter:blur(18px);
+  -webkit-backdrop-filter:blur(18px);
+}
+
+.brand{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  font-size:1.1rem;
+  font-weight:900;
+}
+
+.logo{
+  width:37px;
+  height:37px;
+  border-radius:11px;
+  display:grid;
+  place-items:center;
+  background:linear-gradient(135deg,var(--pink),#8d004a);
+  box-shadow:0 10px 35px rgba(255,0,128,.25);
+  font-weight:900;
+}
+
+.nav{
+  display:none;
+  align-items:center;
+  gap:20px;
+}
+
+.nav a{
+  color:var(--muted);
+  font-size:.8rem;
+  font-weight:800;
+}
+
+.nav a:hover{
+  color:#fff;
+}
+
+.header-actions{
+  display:flex;
+  align-items:center;
+  gap:7px;
+}
+
+.poll{
+  display:none;
+  padding:7px 11px;
+  border:1px solid var(--border);
+  border-radius:var(--pill);
+  background:var(--surface);
+  color:var(--muted);
+  font-size:.7rem;
+  font-weight:800;
+}
+
+.poll-dot{
+  color:var(--green);
+}
+
+.icon{
+  width:38px;
+  height:38px;
+  display:grid;
+  place-items:center;
+  border:1px solid var(--border);
+  border-radius:50%;
+  background:var(--surface);
+  color:#fff;
+}
+
+.container{
+  width:min(920px,100%);
+  margin:auto;
+  padding:20px 14px;
+}
+
+.hero{
+  text-align:center;
+  padding:28px 0 20px;
+}
+
+.badge{
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  padding:7px 13px;
+  border:1px solid var(--border);
+  border-radius:var(--pill);
+  background:rgba(24,24,31,.8);
+  color:var(--muted);
+  font-size:.7rem;
+  font-weight:800;
+  margin-bottom:14px;
+}
+
+.badge strong{
+  color:var(--green);
+}
+
+h1{
+  font-size:clamp(2rem,7vw,3.5rem);
+  line-height:1.05;
+  letter-spacing:-1.7px;
+  font-weight:900;
+}
+
+.hero p{
+  max-width:700px;
+  margin:15px auto 0;
+  color:var(--muted);
+  line-height:1.65;
+  font-size:.9rem;
+}
+
+.card{
+  background:rgba(18,18,23,.94);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  box-shadow:var(--shadow);
+  padding:18px;
+  margin-bottom:18px;
+}
+
+.card-header{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding-bottom:13px;
+  margin-bottom:15px;
+  border-bottom:1px solid var(--border);
+}
+
+.card-title{
+  font-size:.95rem;
+  font-weight:900;
+}
+
+.status{
+  color:var(--green);
+  font-size:.7rem;
+  font-weight:900;
+}
+
+.status-dot{
+  display:inline-block;
+  width:7px;
+  height:7px;
+  border-radius:50%;
+  background:var(--green);
+  box-shadow:0 0 12px var(--green);
+  margin-right:5px;
+}
+
+.mailbox-top{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-bottom:10px;
+}
+
+.label{
+  color:var(--muted);
+  font-size:.68rem;
+  font-weight:900;
+  text-transform:uppercase;
+  letter-spacing:.6px;
+}
+
+.select,
+.input{
+  width:100%;
+  min-height:47px;
+  padding:11px 13px;
+  border:1px solid var(--border);
+  border-radius:12px;
+  outline:none;
+  color:#fff;
+  background:#0d0d12;
+}
+
+.select{
+  width:auto;
+  min-width:150px;
+}
+
+.input:focus,
+.select:focus{
+  border-color:var(--pink);
+  box-shadow:0 0 0 3px rgba(255,0,128,.12);
+}
+
+.email-row{
+  display:grid;
+  grid-template-columns:1fr;
+  gap:9px;
+}
+
+.actions{
+  display:grid;
+  grid-template-columns:1fr;
+  gap:9px;
+  margin-top:10px;
+}
+
+.btn{
+  min-height:46px;
+  border:1px solid rgba(255,255,255,.12);
+  border-radius:var(--pill);
+  padding:10px 16px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+  color:#fff;
+  font-size:.76rem;
+  font-weight:900;
+  transition:var(--transition);
+}
+
+.btn:active{
+  transform:scale(.975);
+}
+
+.pink{
+  background:linear-gradient(135deg,var(--pink),var(--pink2));
+  box-shadow:0 10px 35px rgba(255,0,128,.25);
+}
+
+.green{
+  color:#06130d;
+  background:linear-gradient(135deg,var(--green),var(--green2));
+}
+
+.yellow{
+  color:#08080a;
+  background:linear-gradient(135deg,#ffe900,#d8b800);
+}
+
+.dark{
+  background:linear-gradient(135deg,#292933,#15151c);
+}
+
+.ad{
+  min-height:60px;
+  margin-bottom:18px;
+  padding:12px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  border:1px dashed rgba(255,0,128,.65);
+  border-radius:13px;
+  background:
+    linear-gradient(
+      135deg,
+      rgba(255,0,128,.07),
+      rgba(0,255,136,.04)
+    );
+  text-align:center;
+  overflow:hidden;
+}
+
+.ad:empty{
+  display:none;
+}
+
+.inbox{
+  min-height:190px;
+  max-height:450px;
+  overflow:auto;
+  border-radius:12px;
+}
+
+.empty{
+  min-height:190px;
+  display:grid;
+  place-items:center;
+  text-align:center;
+  color:var(--muted);
+}
+
+.message{
+  display:grid;
+  grid-template-columns:1fr auto;
+  gap:10px;
+  padding:14px 10px;
+  border-bottom:1px solid var(--border);
+  cursor:pointer;
+}
+
+.message:hover{
+  background:rgba(255,255,255,.025);
+}
+
+.message-from{
+  font-weight:900;
+  font-size:.8rem;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.message-subject{
+  margin-top:4px;
+  color:var(--muted);
+  font-size:.74rem;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.message-date{
+  color:var(--muted);
+  font-size:.64rem;
+  white-space:nowrap;
+}
+
+.features{
+  display:grid;
+  grid-template-columns:1fr;
+  gap:10px;
+}
+
+.feature{
+  padding:14px;
+  border:1px solid var(--border);
+  border-radius:13px;
+  background:rgba(255,255,255,.015);
+}
+
+.feature strong{
+  display:block;
+  margin-bottom:4px;
+  font-size:.8rem;
+}
+
+.feature span{
+  color:var(--muted);
+  font-size:.7rem;
+  line-height:1.5;
+}
+
+.footer{
+  width:min(920px,100%);
+  margin:auto;
+  padding:20px 14px 35px;
+  display:flex;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:12px;
+  color:var(--muted);
+  font-size:.68rem;
+}
+
+.footer-links{
+  display:flex;
+  gap:12px;
+}
+
+.modal{
+  position:fixed;
+  inset:0;
+  z-index:5000;
+  display:none;
+  align-items:center;
+  justify-content:center;
+  padding:15px;
+  background:rgba(0,0,0,.82);
+  backdrop-filter:blur(8px);
+}
+
+.modal.show{
+  display:flex;
+}
+
+.modal-box{
+  width:min(650px,100%);
+  max-height:88dvh;
+  overflow:auto;
+  padding:22px;
+  position:relative;
+  background:#15151b;
+  border:1px solid var(--border);
+  border-radius:20px;
+  box-shadow:0 25px 80px rgba(0,0,0,.75);
+}
+
+.close{
+  position:absolute;
+  top:12px;
+  right:12px;
+  width:34px;
+  height:34px;
+  border:1px solid var(--border);
+  border-radius:50%;
+  background:var(--surface);
+  color:#fff;
+}
+
+.otp{
+  margin:15px 0;
+  padding:18px;
+  border:1px solid rgba(0,255,136,.35);
+  border-radius:14px;
+  background:rgba(0,255,136,.05);
+  text-align:center;
+}
+
+.otp-code{
+  margin:8px 0;
+  color:var(--green);
+  font-size:2rem;
+  font-weight:900;
+  letter-spacing:5px;
+}
+
+.link{
+  display:block;
+  margin-top:8px;
+  padding:11px;
+  border:1px solid var(--border);
+  border-radius:10px;
+  background:var(--surface);
+  color:#8fcfff;
+  font-size:.72rem;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+
+.toast-container{
+  position:fixed;
+  right:15px;
+  bottom:15px;
+  z-index:9000;
+  width:min(390px,calc(100vw - 30px));
+  display:grid;
+  gap:8px;
+}
+
+.toast{
+  padding:13px 15px;
+  border:1px solid var(--border);
+  border-radius:13px;
+  background:rgba(20,20,27,.98);
+  box-shadow:var(--shadow);
+  font-size:.74rem;
+}
+
+@media(min-width:640px){
+  .email-row{
+    grid-template-columns:1fr auto;
+  }
+
+  .actions{
+    grid-template-columns:1fr 1fr;
+  }
+
+  .features{
+    grid-template-columns:repeat(3,1fr);
+  }
+
+  .poll{
+    display:block;
+  }
+}
+
+@media(min-width:900px){
+  .nav{
+    display:flex;
+  }
+
+  .menu{
+    display:none;
+  }
+
+  .header{
+    padding-left:28px;
+    padding-right:28px;
+  }
+
+  .card{
+    padding:24px;
+  }
+}
+
+@media(prefers-reduced-motion:reduce){
+  *,
+  *::before,
+  *::after{
+    scroll-behavior:auto!important;
+    transition:none!important;
+    animation:none!important;
+  }
+}
 </style>
 </head>
+
 <body>
-<canvas id="bgCanvas"></canvas>
+
 <header class="header">
-  <a class="brand" href="#section1"><span style="width:34px;height:34px;border-radius:10px;background:var(--primary);display:inline-flex;align-items:center;justify-content:center;box-shadow:0 10px 30px rgba(255,0,128,.35)">T</span><span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">TTTMAIL</span></a>
-  <nav class="nav-links">
-    <a class="nav-link active" onclick="scrollToSection(0)">Home</a>
-    <a class="nav-link" onclick="scrollToSection(1)">Inbox</a>
-    <a class="nav-link" onclick="scrollToSection(2)">OTP</a>
-    <a class="nav-link" onclick="scrollToSection(3)">Features</a>
-    <a class="nav-link" onclick="scrollToSection(4)">Alias</a>
-    <a class="nav-link" onclick="scrollToSection(5)">Analytics</a>
-    <a class="nav-link" onclick="scrollToSection(6)">Security</a>
-    <a class="nav-link" onclick="scrollToSection(7)">API</a>
-    <a class="nav-link" onclick="scrollToSection(8)">FAQ</a>
-    <a class="nav-link" onclick="scrollToSection(9)">About</a>
+  <a class="brand" href="/" aria-label="TTTMAIL home">
+    <span class="logo">T</span>
+    <span class="gradient">TTTMAIL</span>
+  </a>
+
+  <nav class="nav" aria-label="Primary navigation">
+    <a href="#mailbox">Temp Mail</a>
+    <a href="#inbox">Inbox</a>
+    <a href="#features">Features</a>
   </nav>
-  <div style="display:flex;align-items:center;gap:8px">
-    <div class="pill"><i class="fa-solid fa-circle-notch"></i><span id="countdownText">Poll: 4s</span></div>
-    <button class="icon-btn" onclick="openDrawer()"><i class="fa-solid fa-bars"></i></button>
-    <button class="icon-btn" onclick="openModal('settingsModal')"><i class="fa-solid fa-gear"></i></button>
+
+  <div class="header-actions">
+    <div class="poll">
+      <span class="poll-dot">●</span>
+      <span id="pollText">Next check: 4s</span>
+    </div>
+
+    <button class="icon menu" id="notificationButton" type="button" aria-label="Enable notifications">
+      🔔
+    </button>
   </div>
 </header>
 
-<div class="dotbar">
-  <div class="dot active" onclick="scrollToSection(0)"></div>
-  <div class="dot" onclick="scrollToSection(1)"></div>
-  <div class="dot" onclick="scrollToSection(2)"></div>
-  <div class="dot" onclick="scrollToSection(3)"></div>
-  <div class="dot" onclick="scrollToSection(4)"></div>
-  <div class="dot" onclick="scrollToSection(5)"></div>
-  <div class="dot" onclick="scrollToSection(6)"></div>
-  <div class="dot" onclick="scrollToSection(7)"></div>
-  <div class="dot" onclick="scrollToSection(8)"></div>
-  <div class="dot" onclick="scrollToSection(9)"></div>
-</div>
+<main class="container">
 
-<div class="drawer-overlay" id="drawerOverlay" onclick="closeDrawer()"></div>
-<div class="drawer" id="drawer">
-  <div style="display:flex;justify-content:space-between;align-items:center;padding-bottom:12px;border-bottom:1px solid var(--border);margin-bottom:12px">
-    <strong style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">TTTMAIL SUITE</strong>
-    <button class="icon-btn" onclick="closeDrawer()"><i class="fa-solid fa-xmark"></i></button>
+<section class="hero">
+  <div class="badge">
+    <strong>●</strong>
+    REAL INBOX • REAL EMAILS • REAL OTP EXTRACTION
   </div>
-  <div style="display:grid;gap:8px">
-    <button class="btn dark" onclick="closeDrawer();scrollToSection(0)">Home</button>
-    <button class="btn dark" onclick="closeDrawer();scrollToSection(1)">Inbox</button>
-    <button class="btn dark" onclick="closeDrawer();scrollToSection(2)">OTP</button>
-    <button class="btn dark" onclick="closeDrawer();scrollToSection(3)">Features</button>
-    <button class="btn dark" onclick="closeDrawer();scrollToSection(4)">Alias</button>
-    <button class="btn dark" onclick="closeDrawer();scrollToSection(5)">Analytics</button>
-    <button class="btn dark" onclick="closeDrawer();scrollToSection(6)">Security</button>
-    <button class="btn dark" onclick="closeDrawer();scrollToSection(7)">API</button>
-    <button class="btn dark" onclick="closeDrawer();scrollToSection(8)">FAQ</button>
-    <button class="btn dark" onclick="closeDrawer();scrollToSection(9)">About</button>
+
+  <h1>
+    Free
+    <span class="gradient">Temporary Email</span>
+    & Real Inbox
+  </h1>
+
+  <p>
+    Generate a disposable mailbox and receive real incoming messages
+    through the configured temporary-mail provider.
+  </p>
+</section>
+
+<div id="adTop" class="ad"></div>
+
+<section id="mailbox" class="card">
+
+  <div class="card-header">
+    <div class="card-title">✉ Active Temporary Mailbox</div>
+    <div class="status">
+      <span class="status-dot"></span>
+      LIVE
+    </div>
+  </div>
+
+  <div class="mailbox-top">
+    <span class="label">Disposable Email Address</span>
+
+    <select id="domainSelector" class="select" aria-label="Mailbox domain">
+      <option value="1secmail.com">1secmail.com</option>
+      <option value="1secmail.org">1secmail.org</option>
+      <option value="1secmail.net">1secmail.net</option>
+      <option value="esiix.com">esiix.com</option>
+      <option value="wwjmp.com">wwjmp.com</option>
+    </select>
+  </div>
+
+  <div class="email-row">
+    <input
+      id="emailInput"
+      class="input"
+      type="text"
+      readonly
+      aria-label="Temporary email address"
+      value="Creating mailbox..."
+    >
+
+    <button id="copyButton" class="btn pink" type="button">
+      Copy
+    </button>
+  </div>
+
+  <div class="actions">
+    <button id="newEmailButton" class="btn dark" type="button">
+      New Email
+    </button>
+
+    <button id="refreshButton" class="btn green" type="button">
+      Check Inbox
+    </button>
+  </div>
+
+  <div class="actions">
+    <button id="notifyButton" class="btn yellow" type="button">
+      Enable Notifications
+    </button>
+
+    <button id="clearButton" class="btn dark" type="button">
+      Clear Local State
+    </button>
+  </div>
+
+</section>
+
+<div id="adMiddle" class="ad"></div>
+
+<section id="inbox" class="card">
+
+  <div class="card-header">
+    <div class="card-title">
+      Real Live Inbox
+      <span id="inboxCount">(0)</span>
+    </div>
+
+    <button id="refreshButton2" class="btn dark" type="button">
+      Refresh
+    </button>
+  </div>
+
+  <div id="inboxContainer" class="inbox">
+    <div class="empty">
+      Waiting for incoming email...
+    </div>
+  </div>
+
+</section>
+
+<section id="features" class="card">
+
+  <div class="card-header">
+    <div class="card-title">Active Features</div>
+  </div>
+
+  <div class="features">
+
+    <div class="feature">
+      <strong>Real Incoming Emails</strong>
+      <span>
+        Messages are retrieved from the configured temporary-mail provider.
+      </span>
+    </div>
+
+    <div class="feature">
+      <strong>Real OTP Extraction</strong>
+      <span>
+        OTP detection operates only against received message content.
+      </span>
+    </div>
+
+    <div class="feature">
+      <strong>Verification Links</strong>
+      <span>
+        Recognizable verification URLs can be extracted from received emails.
+      </span>
+    </div>
+
+    <div class="feature">
+      <strong>Automatic Polling</strong>
+      <span>
+        The active mailbox is periodically checked automatically.
+      </span>
+    </div>
+
+    <div class="feature">
+      <strong>Browser Notifications</strong>
+      <span>
+        Supported browsers can notify you about newly received messages.
+      </span>
+    </div>
+
+    <div class="feature">
+      <strong>Cloudflare API Gateway</strong>
+      <span>
+        Browser requests use same-origin Worker endpoints instead of directly
+        calling the external mailbox API.
+      </span>
+    </div>
+
+  </div>
+
+</section>
+
+<div id="adBottom" class="ad"></div>
+
+</main>
+
+<footer class="footer">
+  <span>© 2026 TTTMAIL</span>
+
+  <div class="footer-links">
+    <a href="#mailbox">Mailbox</a>
+    <a href="#inbox">Inbox</a>
+    <a href="#features">Features</a>
+  </div>
+</footer>
+
+<div id="messageModal" class="modal" role="dialog" aria-modal="true">
+  <div class="modal-box">
+
+    <button id="closeModal" class="close" type="button">
+      ×
+    </button>
+
+    <h2 id="messageTitle">Email</h2>
+
+    <div
+      id="messageMeta"
+      style="color:var(--muted);font-size:.72rem;margin-top:8px"
+    ></div>
+
+    <div id="otpResult"></div>
+
+    <div id="verificationLinks"></div>
+
+    <div
+      id="messageBody"
+      style="
+        margin-top:14px;
+        padding:14px;
+        border:1px solid var(--border);
+        border-radius:12px;
+        background:#0c0c10;
+        white-space:pre-wrap;
+        word-break:break-word;
+        color:#c7c7d2;
+        font-size:.78rem;
+        line-height:1.65;
+      "
+    ></div>
+
   </div>
 </div>
 
-<div class="scroll-container" id="scrollContainer">
-  <section class="section-viewport"><div class="container">
-    <div class="hero"><div class="pill"><i class="fa-solid fa-bolt"></i> Section 1 of 10</div><h1>Professional <span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Temp Mail</span></h1><p>Real API-backed temporary mailbox generator with live inbox sync and backend OTP endpoints.</p></div>
-    <div class="card">
-      <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:12px">
-        <strong>Active Mailbox</strong>
-        <select class="select" id="domainSelector" style="width:auto" onchange="onDomainChange(this.value)">
-          <option value="1secmail.com">@1secmail.com</option>
-          <option value="1secmail.org">@1secmail.org</option>
-          <option value="1secmail.net">@1secmail.net</option>
-          <option value="esiix.com">@esiix.com</option>
-          <option value="wwjmp.com">@wwjmp.com</option>
-        </select>
-      </div>
-      <input id="emailInput" class="email-box" readonly onclick="copyEmail()" value="Loading..." />
-      <div class="row" style="margin-top:12px">
-        <button class="btn" style="flex:1" onclick="copyEmail()">Copy Email</button>
-        <button class="btn dark" style="flex:1" onclick="generateNewEmail()">New Email</button>
-        <button class="btn green" style="flex:1" onclick="scrollToSection(3)">Features</button>
-      </div>
-    </div>
-  </div></section>
-
-  <section class="section-viewport"><div class="container">
-    <div class="hero"><div class="pill"><i class="fa-solid fa-inbox"></i> Section 2 of 10</div><h1>Live <span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Inbox</span></h1><p>Inbox data is fetched from the Worker API which proxies the mail provider.</p></div>
-    <div class="card">
-      <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:12px;border-bottom:1px solid var(--border);padding-bottom:10px">
-        <strong>Messages (<span id="inboxCount">0</span>)</strong><button class="btn dark" style="width:auto" onclick="fetchInbox()">Refresh</button>
-      </div>
-      <div id="inboxContainer" style="min-height:220px;max-height:360px;overflow:auto"></div>
-    </div>
-  </div></section>
-
-  <section class="section-viewport"><div class="container">
-    <div class="hero"><div class="pill"><i class="fa-solid fa-shield-check"></i> Section 3 of 10</div><h1>OTP <span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Verification</span></h1><p>Real OTP flow using backend storage and optional email delivery provider.</p></div>
-    <div class="card" style="margin-bottom:16px"><strong style="display:block;margin-bottom:10px">Request OTP</strong><input id="otpEmailInput" class="input" placeholder="Enter email address" style="margin-bottom:10px" /><button class="btn" style="width:100%" onclick="requestOtp()">Send OTP</button></div>
-    <div class="card"><strong style="display:block;margin-bottom:10px">Verify OTP</strong><input id="otpCodeInput" class="input" placeholder="6-digit code" maxlength="6" style="margin-bottom:10px;letter-spacing:6px;text-align:center;font-weight:900" /><button class="btn green" style="width:100%" onclick="verifyOtp()">Verify OTP</button><div id="otpVerifyResult" style="margin-top:12px;display:none;padding:12px;border-radius:10px;text-align:center;font-weight:800"></div></div>
-  </div></section>
-
-  <section class="section-viewport"><div class="container">
-    <div class="hero"><div class="pill"><i class="fa-solid fa-cubes"></i> Section 4 of 10</div><h1>100+ <span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Utilities</span></h1><p>Searchable utility catalog with real feature routing structure.</p></div>
-    <div class="card"><input id="featureSearch" class="input" placeholder="Search utilities..." oninput="filterFeatures(this.value)" /><div id="featuresGridContainer" class="grid" style="margin-top:12px"></div></div>
-  </div></section>
-
-  <section class="section-viewport"><div class="container">
-    <div class="hero"><div class="pill"><i class="fa-solid fa-wand-magic-sparkles"></i> Section 5 of 10</div><h1>Email <span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Alias</span></h1><p>Alias generation is real and server-safe; use it for masked mailbox patterns.</p></div>
-    <div class="card"><button class="btn" style="width:100%;margin-bottom:12px" onclick="generateAlias()">Generate Alias</button><div id="aliasResult" style="background:var(--surface);padding:16px;border-radius:12px;text-align:center;font-family:monospace;color:var(--secondary);font-weight:900">Click generate</div></div>
-  </div></section>
-
-  <section class="section-viewport"><div class="container">
-    <div class="hero"><div class="pill"><i class="fa-solid fa-chart-line"></i> Section 6 of 10</div><h1>Mail &amp; <span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Analytics</span></h1><p>Real stats endpoint reflects current worker state and feature count.</p></div>
-    <div class="card"><div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr))"><div class="tile" style="text-align:center"><div style="font-size:1.8rem;font-weight:900;color:var(--secondary)">99.9%</div><div class="muted">Uptime</div></div><div class="tile" style="text-align:center"><div style="font-size:1.8rem;font-weight:900;color:var(--primary)">18ms</div><div class="muted">Latency</div></div><div class="tile" style="text-align:center"><div id="statTotalMsgs" style="font-size:1.8rem;font-weight:900;color:var(--accent)">0</div><div class="muted">Messages</div></div></div></div>
-  </div></section>
-
-  <section class="section-viewport"><div class="container">
-    <div class="hero"><div class="pill"><i class="fa-solid fa-shield-halved"></i> Section 7 of 10</div><h1>Security &amp; <span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Zero Logs</span></h1><p>Security is enforced by backend retention, secrets, and KV expiry configuration.</p></div>
-    <div class="card"><p class="muted" style="line-height:1.7">Use KV expiration, secrets, and HTTPS. Add Turnstile and rate limits server-side for abuse prevention.</p></div>
-  </div></section>
-
-  <section class="section-viewport"><div class="container">
-    <div class="hero"><div class="pill"><i class="fa-solid fa-code"></i> Section 8 of 10</div><h1>API <span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Reference</span></h1><p>All endpoints are handled in the Worker and ready for real frontend/backend integration.</p></div>
-    <div class="card"><pre>GET  /api/health
-GET  /api/features
-GET  /api/mailbox/new?domain=1secmail.com
-GET  /api/inbox?login=...&domain=...
-GET  /api/message?login=...&domain=...&id=...
-POST /api/otp/request
-POST /api/otp/verify
-GET  /api/alias/generate?email=...
-GET  /api/analytics
-GET  /api/routes</pre></div>
-  </div></section>
-
-  <section class="section-viewport"><div class="container">
-    <div class="hero"><div class="pill"><i class="fa-solid fa-circle-question"></i> Section 9 of 10</div><h1>Frequently Asked <span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">Questions</span></h1><p>Short working answers from the live backend model.</p></div>
-    <div class="card"><strong>Are temporary emails free?</strong><p class="muted" style="margin:8px 0 16px">The app is free to run on your stack, but actual mail delivery depends on your chosen provider and configuration.</p><strong>How long are messages stored?</strong><p class="muted">KV expiration and provider retention rules define actual message lifetime.</p></div>
-  </div></section>
-
-  <section class="section-viewport"><div class="container">
-    <div class="hero"><div class="pill"><i class="fa-solid fa-circle-info"></i> Section 10 of 10</div><h1>About <span style="background:linear-gradient(135deg,var(--primary),var(--accent),var(--secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent">TTTMAIL</span></h1><p>Single-file frontend with real Cloudflare Worker backend routes and GitHub auto-deploy support.</p></div>
-    <div class="card"><p class="muted" style="line-height:1.7">This master app is built to be deployed as a Worker, routed through Cloudflare, and deployed through GitHub Actions automatically.</p></div>
-  </div></section>
-</div>
-
-<div class="modal-overlay" id="toolModal"><div class="modal-content"><div class="close" onclick="closeModal('toolModal')"><i class="fa-solid fa-xmark"></i></div><h2 id="toolModalTitle" style="margin-bottom:12px;color:var(--primary)">Tool</h2><p id="toolModalDesc" class="muted" style="margin-bottom:16px"></p><div id="toolModalBody"></div><button class="btn dark" style="width:100%;margin-top:16px" onclick="closeModal('toolModal')">Close</button></div></div>
-<div class="modal-overlay" id="settingsModal"><div class="modal-content"><div class="close" onclick="closeModal('settingsModal')"><i class="fa-solid fa-xmark"></i></div><h2 style="margin-bottom:16px"><i class="fa-solid fa-gear" style="color:var(--primary)"></i> Settings</h2><label class="muted" style="display:block;margin-bottom:8px;font-weight:800">Polling Interval</label><select id="pollSetting" class="select" onchange="updatePollingInterval(this.value)"><option value="4000">Fast (4s)</option><option value="8000">Balanced (8s)</option><option value="15000">Conservative (15s)</option></select><button class="btn" style="width:100%;margin-top:16px" onclick="closeModal('settingsModal');showToast('Settings saved')">Save</button></div></div>
-<div id="toast" class="toast"><strong id="toastMessage">Notification</strong></div>
+<div id="toastContainer" class="toast-container"></div>
 
 <script>
-const canvas=document.getElementById('bgCanvas'),ctx=canvas.getContext('2d');let particles=[],currentEmail={login:'',domain:'1secmail.com',address:''},pollInterval=4000,pollTimer=null,countdownTimer=null;
-function resizeCanvas(){canvas.width=innerWidth;canvas.height=innerHeight}addEventListener('resize',resizeCanvas);resizeCanvas();
-for(let i=0;i<45;i++)particles.push({x:Math.random()*canvas.width,y:Math.random()*canvas.height,r:Math.random()*2.2+1,vx:(Math.random()-.5)*.6,vy:(Math.random()-.5)*.6,c:Math.random()>.5?'#ff0080':'#00ff88'});
-function animateBg(){ctx.clearRect(0,0,canvas.width,canvas.height);ctx.fillStyle='#08080a';ctx.fillRect(0,0,canvas.width,canvas.height);for(const p of particles){p.x+=p.vx;p.y+=p.vy;if(p.x<0||p.x>canvas.width)p.vx*=-1;if(p.y<0||p.y>canvas.height)p.vy*=-1;ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,Math.PI*2);ctx.fillStyle=p.c;ctx.shadowBlur=12;ctx.shadowColor=p.c;ctx.fill();ctx.shadowBlur=0}requestAnimationFrame(animateBg)}animateBg();
+"use strict";
 
-const scrollContainer=document.getElementById('scrollContainer'),sections=[...document.querySelectorAll('.section-viewport')],dots=[...document.querySelectorAll('.dot')],navLinks=[...document.querySelectorAll('.nav-link')];
-function scrollToSection(index){const t=sections[index];if(t)scrollContainer.scrollTo({top:t.offsetTop,behavior:'smooth'})}
-function onContainerScroll(){const vh=scrollContainer.clientHeight||innerHeight;const idx=Math.min(sections.length-1,Math.max(0,Math.round(scrollContainer.scrollTop/vh)));dots.forEach((d,i)=>d.classList.toggle('active',i===idx));navLinks.forEach((n,i)=>n.classList.toggle('active',i===idx))}
-scrollContainer.addEventListener('scroll',onContainerScroll);addEventListener('resize',onContainerScroll);onContainerScroll();
+/* ==========================================================
+   TTTMAIL FRONTEND ENGINE 5.0
+========================================================== */
 
-function openDrawer(){document.getElementById('drawer').classList.add('open');document.getElementById('drawerOverlay').style.display='block'}
-function closeDrawer(){document.getElementById('drawer').classList.remove('open');document.getElementById('drawerOverlay').style.display='none'}
-function openModal(id){document.getElementById(id).style.display='flex'}
-function closeModal(id){document.getElementById(id).style.display='none'}
-function showToast(m){document.getElementById('toastMessage').textContent=m;const t=document.getElementById('toast');t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600)}
-function randomString(len=10){const chars='abcdefghijklmnopqrstuvwxyz0123456789',b=new Uint8Array(len);crypto.getRandomValues(b);return Array.from(b,x=>chars[x%chars.length]).join('')}
-function generateNewEmail(){const domain=document.getElementById('domainSelector').value,login=randomString(10);currentEmail={login,domain,address:`${login}@${domain}`};document.getElementById('emailInput').value=currentEmail.address;document.getElementById('otpEmailInput').value=currentEmail.address;fetchInbox();showToast('New mailbox created')}
-function onDomainChange(domain){currentEmail.domain=domain;generateNewEmail()}
-async function copyEmail(){if(!currentEmail.address)return showToast('Email not ready');try{await navigator.clipboard.writeText(currentEmail.address);showToast('Copied')}catch{showToast('Copy failed')}}
-function escapeHtml(s){return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;")}
-function renderInbox(messages){document.getElementById('inboxCount').textContent=messages.length;document.getElementById('statTotalMsgs').textContent=messages.length;const c=document.getElementById('inboxContainer');if(!messages.length){c.innerHTML='<div style="text-align:center;padding:36px;color:var(--muted)">No messages yet</div>';return}c.innerHTML=messages.map(m=>`<div style="background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:10px"><div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px"><strong style="color:var(--secondary)">${escapeHtml(m.from||'Unknown')}</strong><span style="color:var(--muted);font-size:.8rem">${escapeHtml(m.date||'')}</span></div><div style="font-weight:800;margin-bottom:8px">${escapeHtml(m.subject||'(No subject)')}</div><button class="btn dark" style="width:auto" onclick="openMessage('${m.id}')">Open</button></div>`).join('')}
-async function fetchInbox(){if(!currentEmail.login)generateNewEmail();const url='/api/inbox?login='+encodeURIComponent(currentEmail.login)+'&domain='+encodeURIComponent(currentEmail.domain);try{const res=await fetch(url);const data=await res.json();renderInbox(Array.isArray(data.messages)?data.messages:[])}catch{document.getElementById('inboxContainer').innerHTML='<div style="padding:20px;color:var(--muted)">Inbox request failed.</div>'}}
-async function openMessage(id){const url='/api/message?login='+encodeURIComponent(currentEmail.login)+'&domain='+encodeURIComponent(currentEmail.domain)+'&id='+encodeURIComponent(id);try{const res=await fetch(url);const data=await res.json();const msg=data.message||{};document.getElementById('toolModalTitle').textContent=msg.subject||'Message';document.getElementById('toolModalDesc').textContent='From: '+(msg.from||'');document.getElementById('toolModalBody').innerHTML='<pre>'+escapeHtml(msg.textBody||msg.body||'')+'</pre>';openModal('toolModal')}catch{showToast('Failed to open message')}}
-function generateAlias(){if(!currentEmail.address)generateNewEmail();const [login,domain]=currentEmail.address.split('@');const alias=login+'+'+randomString(6)+'@'+domain;document.getElementById('aliasResult').textContent=alias;showToast('Alias generated')}
-async function requestOtp(){const email=document.getElementById('otpEmailInput').value.trim();if(!email)return showToast('Enter email first');const res=await fetch('/api/otp/request',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email})});const data=await res.json();showToast(data.message||(res.ok?'OTP sent':'OTP failed'))}
-async function verifyOtp(){const email=document.getElementById('otpEmailInput').value.trim(),code=document.getElementById('otpCodeInput').value.trim();if(!email||!code)return showToast('Enter email and code');const res=await fetch('/api/otp/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,code})});const data=await res.json();const box=document.getElementById('otpVerifyResult');box.style.display='block';box.style.background=res.ok?'rgba(0,255,136,.12)':'rgba(255,0,128,.12)';box.style.border='1px solid '+(res.ok?'var(--secondary)':'var(--primary)');box.style.color=res.ok?'var(--secondary)':'var(--primary)';box.textContent=data.message||(res.ok?'Verified':'Failed')}
-const FEATURES=${JSON.stringify(FEATURE_LIST)};
-function renderFeatures(list){document.getElementById('featuresGridContainer').innerHTML=list.map(f=>`<div class="tile" onclick="openFeature(${f.id})"><div style="width:38px;height:38px;border-radius:10px;background:rgba(255,0,128,.12);border:1px solid rgba(255,0,128,.25);display:flex;align-items:center;justify-content:center;color:var(--primary)"><i class="fa-solid ${f.icon}"></i></div><div style="font-weight:900">${escapeHtml(f.title)}</div><div style="color:var(--muted);font-size:.82rem;line-height:1.4">${escapeHtml(f.description)}</div></div>`).join('')}
-function filterFeatures(q){q=q.toLowerCase().trim();renderFeatures(FEATURES.filter(x=>x.title.toLowerCase().includes(q)||x.description.toLowerCase().includes(q)))}
-function openFeature(id){const f=FEATURES.find(x=>x.id===id);document.getElementById('toolModalTitle').textContent=f.title;document.getElementById('toolModalDesc').textContent=f.description;document.getElementById('toolModalBody').innerHTML='<div style="display:grid;gap:10px"><div><strong>Status:</strong> Ready</div><div><strong>Category:</strong> '+f.category+'</div><div><strong>Execution:</strong> Wire this feature to your backend route</div></div>';openModal('toolModal')}
-async function updatePollingInterval(value){pollInterval=Number(value);if(pollTimer)clearInterval(pollTimer);if(countdownTimer)clearInterval(countdownTimer);startPolling();showToast('Polling updated')}
-function startPolling(){let remain=Math.round(pollInterval/1000);document.getElementById('countdownText').textContent='Poll: '+remain+'s';pollTimer=setInterval(fetchInbox,pollInterval);countdownTimer=setInterval(()=>{remain--;if(remain<=0)remain=Math.round(pollInterval/1000);document.getElementById('countdownText').textContent='Poll: '+remain+'s'},1000)}
-renderFeatures(FEATURES);generateNewEmail();fetchInbox();startPolling();
-</script>
-</body>
-</html>`;
+const APP = Object.freeze({
+  version: "5.0.0",
+  storageKey: "tttmail_state_v5",
+  defaultDomain: "1secmail.com",
+  defaultPoll: 4000,
+  maxMessages: 50,
+  allowedPolls: Object.freeze([
+    4000,
+    6000,
+    8000,
+    15000,
+    30000
+  ])
+});
 
-async function sendOtpEmail(env, to, code) {
-  if (!env.RESEND_API_KEY) {
-    return { ok: false, provider: "none", message: "RESEND_API_KEY missing" };
-  }
+const state = {
+  login: "",
+  domain: APP.defaultDomain,
+  email: "",
+  pollMs: APP.defaultPoll,
+  messages: [],
+  messageIds: new Set(),
+  pollTimer: null,
+  countdownTimer: null,
+  countdown: 4,
+  loading: false,
+  initialized: false
+};
 
-  const from = env.MAIL_FROM || "TTTMAIL <no-reply@yourdomain.com>";
-  const response = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${env.RESEND_API_KEY}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      from,
-      to,
-      subject: "Your OTP code",
-      html: `<div style="font-family:Arial,sans-serif">
-        <h2>Your OTP code</h2>
-        <p style="font-size:28px;font-weight:800;letter-spacing:4px">${code}</p>
-        <p>This code expires in 10 minutes.</p>
-      </div>`,
-      text: `Your OTP code is ${code}. It expires in 10 minutes.`
-    })
-  });
+const $ = id => document.getElementById(id);
 
-  const details = await response.text().catch(() => "");
-  return { ok: response.ok, status: response.status, details, provider: "resend" };
+/* ==========================================================
+   SAFE RANDOM MAILBOX NAME
+========================================================== */
+
+const FIRST = [
+  "alex","david","sarah","michael","jessica",
+  "robert","emily","daniel","olivia","william",
+  "sophia","james","charlotte","benjamin","mia",
+  "lucas","harper","henry","evelyn","mason",
+  "ethan","amelia","noah","ava","logan",
+  "ella","liam","grace","jack","chloe"
+];
+
+const LAST = [
+  "turner","miller","smith","johnson","williams",
+  "brown","jones","garcia","davis","rodriguez",
+  "martinez","hernandez","lopez","gonzalez",
+  "wilson","anderson","thomas","taylor","moore",
+  "jackson","white","harris","martin","thompson"
+];
+
+const PREFIX = [
+  "secure","verify","account","support","client",
+  "portal","cloud","dev","mail","auth",
+  "gateway","service","business","connect","access"
+];
+
+function randomInt(min,max){
+  return Math.floor(
+    Math.random() * (max - min + 1)
+  ) + min;
 }
 
-async function handleApi(request, env, url) {
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
+function generateLogin(){
+  const first =
+    FIRST[randomInt(0,FIRST.length - 1)];
 
-  if (url.pathname === "/api/health") {
-    return json({
-      ok: true,
-      service: "tttmail-worker",
-      time: new Date().toISOString(),
-      kv: !!env.TTTMAIL_KV,
-      resend: !!env.RESEND_API_KEY
+  const last =
+    LAST[randomInt(0,LAST.length - 1)];
+
+  const prefix =
+    PREFIX[randomInt(0,PREFIX.length - 1)];
+
+  const number =
+    randomInt(100000,999999);
+
+  return (
+    prefix +
+    "." +
+    first +
+    "." +
+    last +
+    number
+  )
+  .toLowerCase()
+  .replace(/[^a-z0-9._-]/g,"")
+  .slice(0,60);
+}
+
+/* ==========================================================
+   MAILBOX STATE
+========================================================== */
+
+function buildEmail(){
+  return state.login + "@" + state.domain;
+}
+
+function saveState(){
+  try{
+    localStorage.setItem(
+      APP.storageKey,
+      JSON.stringify({
+        login:state.login,
+        domain:state.domain,
+        pollMs:state.pollMs
+      })
+    );
+  }catch(error){
+    console.warn("State save failed",error);
+  }
+}
+
+function restoreState(){
+
+  try{
+
+    const raw =
+      localStorage.getItem(APP.storageKey);
+
+    if(!raw) return false;
+
+    const saved =
+      JSON.parse(raw);
+
+    if(
+      typeof saved.login !== "string" ||
+      !/^[a-zA-Z0-9._-]+$/.test(saved.login) ||
+      saved.login.length > 64
+    ){
+      return false;
+    }
+
+    const domains = [
+      "1secmail.com",
+      "1secmail.org",
+      "1secmail.net",
+      "esiix.com",
+      "wwjmp.com"
+    ];
+
+    if(
+      typeof saved.domain !== "string" ||
+      !domains.includes(saved.domain)
+    ){
+      return false;
+    }
+
+    state.login = saved.login;
+    state.domain = saved.domain;
+
+    if(
+      APP.allowedPolls.includes(
+        Number(saved.pollMs)
+      )
+    ){
+      state.pollMs = Number(saved.pollMs);
+    }
+
+    state.email = buildEmail();
+
+    return true;
+
+  }catch{
+    return false;
+  }
+}
+
+function updateEmailUI(){
+
+  const input = $("emailInput");
+
+  if(input){
+    input.value = state.email;
+  }
+
+  const selector =
+    $("domainSelector");
+
+  if(selector){
+    selector.value = state.domain;
+  }
+}
+
+function resetMessages(){
+
+  state.messages = [];
+  state.messageIds = new Set();
+
+  renderInbox();
+}
+
+function setMailbox(login,domain){
+
+  state.login = login;
+  state.domain = domain;
+  state.email = buildEmail();
+
+  resetMessages();
+
+  saveState();
+  updateEmailUI();
+  restartPolling();
+
+  fetchInbox(false);
+}
+
+function generateNewEmail(){
+
+  setMailbox(
+    generateLogin(),
+    state.domain
+  );
+
+  showToast(
+    "New temporary mailbox created."
+  );
+}
+
+/* ==========================================================
+   CLIPBOARD
+========================================================== */
+
+async function copyText(text){
+
+  if(!text) return false;
+
+  try{
+
+    if(
+      navigator.clipboard &&
+      window.isSecureContext
+    ){
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+
+    const textarea =
+      document.createElement("textarea");
+
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+
+    document.body.appendChild(textarea);
+
+    textarea.focus();
+    textarea.select();
+
+    const ok =
+      document.execCommand("copy");
+
+    textarea.remove();
+
+    return ok;
+
+  }catch{
+    return false;
+  }
+}
+
+async function copyEmail(){
+
+  const ok =
+    await copyText(state.email);
+
+  showToast(
+    ok
+      ? "Temporary email copied."
+      : "Unable to copy the email address."
+  );
+}
+
+/* ==========================================================
+   SAME-ORIGIN WORKER API
+========================================================== */
+
+async function apiRequest(path,params={}){
+
+  const url =
+    new URL(
+      path,
+      window.location.origin
+    );
+
+  for(
+    const [key,value]
+    of Object.entries(params)
+  ){
+    url.searchParams.set(
+      key,
+      String(value)
+    );
+  }
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () => controller.abort(),
+      15000
+    );
+
+  try{
+
+    const response =
+      await fetch(
+        url.toString(),
+        {
+          method:"GET",
+          cache:"no-store",
+          credentials:"same-origin",
+          headers:{
+            "Accept":"application/json"
+          },
+          signal:controller.signal
+        }
+      );
+
+    let data = null;
+
+    try{
+      data = await response.json();
+    }catch{
+      throw new Error(
+        "INVALID_SERVER_RESPONSE"
+      );
+    }
+
+    if(!response.ok || data?.ok === false){
+
+      const error =
+        new Error(
+          data?.message ||
+          "API request failed."
+        );
+
+      error.code =
+        data?.error ||
+        "API_ERROR";
+
+      error.status =
+        response.status;
+
+      throw error;
+    }
+
+    return data;
+
+  }finally{
+
+    clearTimeout(timer);
+  }
+}
+
+/* ==========================================================
+   FETCH INBOX
+========================================================== */
+
+async function fetchInbox(manual=false){
+
+  if(
+    state.loading ||
+    !state.login ||
+    !state.domain
+  ){
+    return;
+  }
+
+  state.loading = true;
+
+  try{
+
+    const data =
+      await apiRequest(
+        "/api/inbox",
+        {
+          login:state.login,
+          domain:state.domain
+        }
+      );
+
+    const messages =
+      Array.isArray(data.messages)
+        ? data.messages
+        : [];
+
+    const oldIds =
+      new Set(state.messageIds);
+
+    const normalized =
+      messages
+        .filter(
+          item =>
+            item &&
+            item.id
+        )
+        .slice(
+          0,
+          APP.maxMessages
+        );
+
+    state.messages =
+      normalized;
+
+    state.messageIds =
+      new Set(
+        normalized.map(
+          item => String(item.id)
+        )
+      );
+
+    renderInbox();
+
+    const newMessages =
+      normalized.filter(
+        item =>
+          !oldIds.has(
+            String(item.id)
+          )
+      );
+
+    if(
+      oldIds.size > 0 &&
+      newMessages.length > 0
+    ){
+
+      const newest =
+        newMessages[0];
+
+      notifyNewEmail(
+        newest.subject ||
+          "New email received",
+        newest.from ||
+          "TTTMAIL"
+      );
+
+      showToast(
+        "New email received."
+      );
+    }
+
+    if(manual){
+
+      showToast(
+        normalized.length
+          ? normalized.length +
+            " email(s) found."
+          : "Inbox checked — no messages yet."
+      );
+    }
+
+  }catch(error){
+
+    console.error(
+      "TTTMAIL inbox error:",
+      error
+    );
+
+    if(manual){
+
+      if(
+        error.code ===
+        "MAIL_PROVIDER_UNAVAILABLE"
+      ){
+        showToast(
+          "Mail provider is temporarily unavailable."
+        );
+      }else{
+        showToast(
+          "Unable to check the inbox."
+        );
+      }
+    }
+
+  }finally{
+
+    state.loading = false;
+
+    state.countdown =
+      Math.ceil(
+        state.pollMs / 1000
+      );
+
+    updateCountdown();
+  }
+}
+
+/* ==========================================================
+   OPEN MESSAGE
+========================================================== */
+
+async function openMessage(message){
+
+  if(
+    !message ||
+    !message.id
+  ){
+    return;
+  }
+
+  showToast(
+    "Loading email..."
+  );
+
+  try{
+
+    const data =
+      await apiRequest(
+        "/api/message",
+        {
+          login:state.login,
+          domain:state.domain,
+          id:message.id
+        }
+      );
+
+    if(!data.message){
+      throw new Error(
+        "EMPTY_MESSAGE"
+      );
+    }
+
+    renderMessage(
+      {
+        ...message,
+        ...data.message
+      }
+    );
+
+    openModal();
+
+  }catch(error){
+
+    console.error(
+      "Message loading error:",
+      error
+    );
+
+    showToast(
+      "Unable to load this email."
+    );
+  }
+}
+
+/* ==========================================================
+   OTP EXTRACTION
+========================================================== */
+
+function extractOtp(text){
+
+  if(!text) return null;
+
+  const normalized =
+    String(text)
+      .replace(/\r/g," ")
+      .replace(/\n/g," ")
+      .replace(/\s+/g," ");
+
+  const patterns = [
+
+    /\b(?:OTP|one[-\s]?time password|verification code|security code|confirmation code|login code|authentication code|auth code)\D{0,50}(\d{4,8})\b/i,
+
+    /\b(?:code|pin)\D{0,20}(\d{4,8})\b/i,
+
+    /\b(\d{6})\b/,
+
+    /\b(\d{5})\b/,
+
+    /\b(\d{4})\b/
+  ];
+
+  for(
+    const regex of patterns
+  ){
+
+    const match =
+      normalized.match(regex);
+
+    if(
+      match &&
+      match[1] &&
+      /^\d{4,8}$/.test(match[1])
+    ){
+
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+/* ==========================================================
+   VERIFICATION LINK EXTRACTION
+========================================================== */
+
+function extractVerificationLinks(text){
+
+  if(!text) return [];
+
+  const matches =
+    String(text)
+      .match(
+        /https?:\/\/[^\s<>"')]+/gi
+      ) || [];
+
+  const unique =
+    [...new Set(
+      matches.map(
+        url =>
+          url.replace(
+            /[),.;]+$/,
+            ""
+          )
+      )
+    )];
+
+  return unique
+    .filter(url => {
+
+      try{
+
+        const parsed =
+          new URL(url);
+
+        if(
+          parsed.protocol !==
+          "https:" &&
+          parsed.protocol !==
+          "http:"
+        ){
+          return false;
+        }
+
+        const value =
+          url.toLowerCase();
+
+        return (
+          value.includes("verify") ||
+          value.includes("confirm") ||
+          value.includes("activate") ||
+          value.includes("validation") ||
+          value.includes("authentication") ||
+          value.includes("auth") ||
+          value.includes("token") ||
+          value.includes("account")
+        );
+
+      }catch{
+
+        return false;
+      }
+    })
+    .slice(0,10);
+}
+
+/* ==========================================================
+   HTML STRIPPER
+========================================================== */
+
+function stripHtml(html){
+
+  if(!html) return "";
+
+  const temp =
+    document.createElement("div");
+
+  temp.innerHTML = html;
+
+  return (
+    temp.textContent ||
+    temp.innerText ||
+    ""
+  );
+}
+
+/* ==========================================================
+   SAFE HTML ESCAPING
+========================================================== */
+
+function escapeHtml(value){
+
+  return String(value ?? "")
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;")
+    .replace(/'/g,"&#039;");
+}
+
+/* ==========================================================
+   INBOX RENDER
+========================================================== */
+
+function renderInbox(){
+
+  const container =
+    $("inboxContainer");
+
+  const count =
+    $("inboxCount");
+
+  if(!container) return;
+
+  if(count){
+    count.textContent =
+      "(" +
+      state.messages.length +
+      ")";
+  }
+
+  if(!state.messages.length){
+
+    container.innerHTML =
+      '<div class="empty">No email received yet.</div>';
+
+    return;
+  }
+
+  container.innerHTML =
+    state.messages
+      .map(message => {
+
+        const id =
+          String(message.id);
+
+        return (
+          '<article class="message" ' +
+          'role="button" tabindex="0" ' +
+          'data-message-id="' +
+          escapeHtml(id) +
+          '">' +
+
+          '<div>' +
+
+          '<div class="message-from">' +
+          escapeHtml(
+            message.from ||
+            "Unknown sender"
+          ) +
+          '</div>' +
+
+          '<div class="message-subject">' +
+          escapeHtml(
+            message.subject ||
+            "(No subject)"
+          ) +
+          '</div>' +
+
+          '</div>' +
+
+          '<time class="message-date">' +
+          escapeHtml(
+            message.date ||
+            ""
+          ) +
+          '</time>' +
+
+          '</article>'
+        );
+      })
+      .join("");
+
+  container
+    .querySelectorAll(".message")
+    .forEach(element => {
+
+      const id =
+        element.dataset.messageId;
+
+      element.addEventListener(
+        "click",
+        () => {
+
+          const message =
+            state.messages.find(
+              item =>
+                String(item.id) === id
+            );
+
+          if(message){
+            openMessage(message);
+          }
+        }
+      );
+
+      element.addEventListener(
+        "keydown",
+        event => {
+
+          if(
+            event.key === "Enter" ||
+            event.key === " "
+          ){
+
+            event.preventDefault();
+
+            const message =
+              state.messages.find(
+                item =>
+                  String(item.id) === id
+              );
+
+            if(message){
+              openMessage(message);
+            }
+          }
+        }
+      );
     });
+}
+
+/* ==========================================================
+   MESSAGE RENDER
+========================================================== */
+
+function renderMessage(message){
+
+  const subject =
+    message.subject ||
+    "(No subject)";
+
+  const from =
+    message.from ||
+    "Unknown sender";
+
+  const body =
+    message.textBody ||
+    message.body ||
+    stripHtml(
+      message.htmlBody ||
+      ""
+    ) ||
+    "";
+
+  const fullText =
+    subject +
+    "\n" +
+    body;
+
+  const otp =
+    extractOtp(fullText);
+
+  const links =
+    extractVerificationLinks(
+      body +
+      "\n" +
+      (message.htmlBody || "")
+    );
+
+  $("messageTitle")
+    .textContent =
+      subject;
+
+  $("messageMeta")
+    .textContent =
+      "From: " +
+      from +
+      (
+        message.date
+          ? " • " + message.date
+          : ""
+      );
+
+  if(otp){
+
+    $("otpResult").innerHTML =
+      '<div class="otp">' +
+
+      '<div style="color:var(--muted);font-size:.68rem;font-weight:900">' +
+      'OTP DETECTED FROM RECEIVED EMAIL' +
+      '</div>' +
+
+      '<div class="otp-code">' +
+      escapeHtml(otp) +
+      '</div>' +
+
+      '<button id="copyOtpButton" class="btn green" style="width:100%" type="button">' +
+      'Copy OTP' +
+      '</button>' +
+
+      '</div>';
+
+    $("copyOtpButton")
+      .addEventListener(
+        "click",
+        async () => {
+
+          const ok =
+            await copyText(otp);
+
+          showToast(
+            ok
+              ? "OTP copied."
+              : "Unable to copy OTP."
+          );
+        }
+      );
+
+  }else{
+
+    $("otpResult").innerHTML =
+      '<div style="margin-top:15px;padding:13px;border:1px solid var(--border);border-radius:12px;color:var(--muted);font-size:.75rem">' +
+      'No recognizable OTP code was detected in this email.' +
+      '</div>';
   }
 
-  if (url.pathname === "/api/features") return json({ ok: true, total: FEATURE_LIST.length, features: FEATURE_LIST });
+  if(links.length){
 
-  if (url.pathname === "/api/mailbox/new") {
-    const domain = url.searchParams.get("domain") || "1secmail.com";
-    const mailbox = makeMailbox(domain);
-    if (env.TTTMAIL_KV) await env.TTTMAIL_KV.put(`mb:${mailbox.login}`, JSON.stringify(mailbox), { expirationTtl: 86400 });
-    return json({ ok: true, mailbox });
+    $("verificationLinks").innerHTML =
+      '<div style="margin-top:14px;color:var(--yellow);font-size:.7rem;font-weight:900">' +
+      'VERIFICATION / ACTIVATION LINKS' +
+      '</div>' +
+
+      links
+        .map(url =>
+          '<a class="link" href="' +
+          escapeHtml(url) +
+          '" target="_blank" rel="noopener noreferrer nofollow">' +
+          escapeHtml(url) +
+          '</a>'
+        )
+        .join("");
+
+  }else{
+
+    $("verificationLinks").innerHTML = "";
   }
 
-  if (url.pathname === "/api/mailbox/get") {
-    const login = url.searchParams.get("login");
-    const domain = url.searchParams.get("domain") || "1secmail.com";
-    if (!login) return json({ ok: false, error: "login required" }, 400);
-    const stored = env.TTTMAIL_KV ? await env.TTTMAIL_KV.get(`mb:${login}`) : null;
-    return json({ ok: true, mailbox: stored ? JSON.parse(stored) : { login, domain, address: `${login}@${domain}` } });
+  $("messageBody")
+    .textContent =
+      body ||
+      "No readable text body was returned by the mailbox provider.";
+}
+
+/* ==========================================================
+   NOTIFICATIONS
+========================================================== */
+
+async function requestNotifications(){
+
+  if(
+    !("Notification" in window)
+  ){
+
+    showToast(
+      "This browser does not support notifications."
+    );
+
+    return;
   }
 
-  if (url.pathname === "/api/inbox") {
-    const login = url.searchParams.get("login");
-    const domain = url.searchParams.get("domain") || "1secmail.com";
-    if (!login) return json({ ok: false, error: "login required" }, 400);
-    const api = `https://www.1secmail.com/api/v1/?action=getMessages&login=${encodeURIComponent(login)}&domain=${encodeURIComponent(domain)}`;
-    const res = await fetch(api, { cf: { cacheTtl: 0, cacheEverything: false } });
-    const messages = await res.json();
-    return json({ ok: true, messages: Array.isArray(messages) ? messages : [] });
-  }
+  try{
 
-  if (url.pathname === "/api/message") {
-    const login = url.searchParams.get("login");
-    const domain = url.searchParams.get("domain") || "1secmail.com";
-    const id = url.searchParams.get("id");
-    if (!login || !id) return json({ ok: false, error: "login and id required" }, 400);
-    const api = `https://www.1secmail.com/api/v1/?action=readMessage&login=${encodeURIComponent(login)}&domain=${encodeURIComponent(domain)}&id=${encodeURIComponent(id)}`;
-    const res = await fetch(api, { cf: { cacheTtl: 0, cacheEverything: false } });
-    const message = await res.json();
-    return json({ ok: true, message });
-  }
+    const permission =
+      await Notification.requestPermission();
 
-  if (url.pathname === "/api/otp/request") {
-    if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
-    let body = {};
-    try {
-      body = await request.json();
-    } catch {
-      return json({ ok: false, error: "Invalid JSON body" }, 400);
+    if(
+      permission === "granted"
+    ){
+
+      showToast(
+        "Browser notifications enabled."
+      );
+
+      new Notification(
+        "TTTMAIL",
+        {
+          body:
+            "Notifications are enabled for new inbox messages.",
+          tag:
+            "tttmail-enabled"
+        }
+      );
+
+    }else{
+
+      showToast(
+        "Notification permission was not granted."
+      );
     }
 
-    const email = String(body.email || "").trim().toLowerCase();
-    if (!email || !email.includes("@")) return json({ ok: false, error: "Valid email required" }, 400);
+  }catch(error){
 
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-    const pepper = env.OTP_PEPPER || "change-this-in-production";
-    const codeHash = await sha256Base64(`${email}:${code}:${pepper}`);
+    console.error(
+      "Notification error:",
+      error
+    );
 
-    const record = { email, codeHash, expiresAt: Date.now() + 10 * 60 * 1000 };
-    if (env.TTTMAIL_KV) await env.TTTMAIL_KV.put(`otp:${email}`, JSON.stringify(record), { expirationTtl: 600 });
+    showToast(
+      "Notification permission could not be requested."
+    );
+  }
+}
 
-    const sent = await sendOtpEmail(env, email, code);
+function notifyNewEmail(
+  subject,
+  from
+){
 
-    if (!sent.ok) {
-      return json({
-        ok: false,
-        error: "OTP send failed",
-        provider: sent.provider,
-        status: sent.status || 500,
-        details: sent.details || sent.message || "Unknown error"
-      }, 502);
-    }
-
-    return json({ ok: true, email, delivery: "sent", message: "OTP sent successfully" });
+  if(
+    !("Notification" in window) ||
+    Notification.permission !==
+      "granted"
+  ){
+    return;
   }
 
-  if (url.pathname === "/api/otp/verify") {
-    if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
-    let body = {};
-    try {
-      body = await request.json();
-    } catch {
-      return json({ ok: false, error: "Invalid JSON body" }, 400);
-    }
+  try{
 
-    const email = String(body.email || "").trim().toLowerCase();
-    const code = String(body.code || "").trim();
-    if (!email || !code) return json({ ok: false, error: "email and code required" }, 400);
+    new Notification(
+      "TTTMAIL — New Email",
+      {
+        body:
+          String(from) +
+          ": " +
+          String(subject),
+        tag:
+          "tttmail-new-email"
+      }
+    );
 
-    const stored = env.TTTMAIL_KV ? await env.TTTMAIL_KV.get(`otp:${email}`) : null;
-    if (!stored) return json({ ok: false, verified: false, message: "OTP not found or expired" }, 404);
+  }catch{}
+}
 
-    const record = JSON.parse(stored);
-    if (Date.now() > record.expiresAt) {
-      await env.TTTMAIL_KV.delete(`otp:${email}`);
-      return json({ ok: false, verified: false, message: "OTP expired" }, 400);
-    }
+/* ==========================================================
+   POLLING
+========================================================== */
 
-    const checkHash = await sha256Base64(`${email}:${code}:${env.OTP_PEPPER || "change-this-in-production"}`);
-    if (checkHash !== record.codeHash) return json({ ok: false, verified: false, message: "Invalid OTP" }, 401);
+function updateCountdown(){
 
-    await env.TTTMAIL_KV.delete(`otp:${email}`);
-    return json({ ok: true, verified: true, message: "OTP verified" });
+  const element =
+    $("pollText");
+
+  if(!element) return;
+
+  element.textContent =
+    "Next check: " +
+    Math.max(
+      0,
+      state.countdown
+    ) +
+    "s";
+}
+
+function restartPolling(){
+
+  if(state.pollTimer){
+    clearInterval(
+      state.pollTimer
+    );
   }
 
-  if (url.pathname === "/api/alias/generate") {
-    const email = url.searchParams.get("email");
-    if (!email || !email.includes("@")) return json({ ok: false, error: "email required" }, 400);
-    const [login, domain] = email.split("@");
-    return json({ ok: true, alias: `${login}+${randomString(6)}@${domain}` });
+  if(state.countdownTimer){
+    clearInterval(
+      state.countdownTimer
+    );
   }
 
-  if (url.pathname === "/api/analytics") {
-    return json({
-      ok: true,
-      stats: {
-        uptime: "99.9%",
-        edgeLatencyMs: 18,
-        featureCount: FEATURE_LIST.length,
-        time: new Date().toISOString()
+  state.countdown =
+    Math.ceil(
+      state.pollMs / 1000
+    );
+
+  updateCountdown();
+
+  state.pollTimer =
+    setInterval(
+      () => {
+
+        state.countdown =
+          Math.ceil(
+            state.pollMs / 1000
+          );
+
+        fetchInbox(false);
+
+      },
+      state.pollMs
+    );
+
+  state.countdownTimer =
+    setInterval(
+      () => {
+
+        if(
+          state.countdown > 0
+        ){
+          state.countdown--;
+        }
+
+        updateCountdown();
+
+      },
+      1000
+    );
+}
+
+/* ==========================================================
+   DOMAIN CHANGE
+========================================================== */
+
+$("domainSelector")
+  .addEventListener(
+    "change",
+    event => {
+
+      const domain =
+        event.target.value;
+
+      if(!domain) return;
+
+      setMailbox(
+        generateLogin(),
+        domain
+      );
+
+      showToast(
+        "New mailbox created."
+      );
+    }
+  );
+
+/* ==========================================================
+   MODAL
+========================================================== */
+
+function openModal(){
+
+  $("messageModal")
+    .classList.add("show");
+
+  document.body.style.overflow =
+    "hidden";
+}
+
+function closeModal(){
+
+  $("messageModal")
+    .classList.remove("show");
+
+  document.body.style.overflow =
+    "";
+}
+
+$("closeModal")
+  .addEventListener(
+    "click",
+    closeModal
+  );
+
+$("messageModal")
+  .addEventListener(
+    "click",
+    event => {
+
+      if(
+        event.target ===
+        $("messageModal")
+      ){
+        closeModal();
+      }
+    }
+  );
+
+document.addEventListener(
+  "keydown",
+  event => {
+
+    if(
+      event.key === "Escape"
+    ){
+      closeModal();
+    }
+  }
+);
+
+/* ==========================================================
+   TOAST
+========================================================== */
+
+function showToast(message){
+
+  const container =
+    $("toastContainer");
+
+  const toast =
+    document.createElement("div");
+
+  toast.className =
+    "toast";
+
+  toast.textContent =
+    String(message);
+
+  container.appendChild(
+    toast
+  );
+
+  setTimeout(
+    () => toast.remove(),
+    3500
+  );
+}
+
+/* ==========================================================
+   ADS
+========================================================== */
+
+async function loadAds(){
+
+  try{
+
+    const data =
+      await apiRequest(
+        "/api/ads"
+      );
+
+    const map = {
+      adTop:data.top,
+      adMiddle:data.middle,
+      adBottom:data.bottom
+    };
+
+    for(
+      const [id,html]
+      of Object.entries(map)
+    ){
+
+      const element =
+        $(id);
+
+      if(!element) continue;
+
+      if(
+        typeof html === "string" &&
+        html.trim()
+      ){
+
+        /*
+         * KV ad content must only contain trusted
+         * publisher-provided Adsterra markup.
+         */
+        element.innerHTML =
+          html;
+      }else{
+
+        element.replaceChildren();
+      }
+    }
+
+  }catch(error){
+
+    console.warn(
+      "Advertisement loading failed:",
+      error
+    );
+
+    [
+      "adTop",
+      "adMiddle",
+      "adBottom"
+    ].forEach(id => {
+
+      const element = $(id);
+
+      if(element){
+        element.replaceChildren();
       }
     });
   }
-
-  if (url.pathname === "/api/routes") {
-    return json({
-      ok: true,
-      routes: [
-        "/api/health",
-        "/api/features",
-        "/api/mailbox/new",
-        "/api/mailbox/get",
-        "/api/inbox",
-        "/api/message",
-        "/api/otp/request",
-        "/api/otp/verify",
-        "/api/alias/generate",
-        "/api/analytics"
-      ]
-    });
-  }
-
-  return json({ ok: false, error: "Not found" }, 404);
 }
 
+/* ==========================================================
+   CLEAR LOCAL STATE
+========================================================== */
+
+$("clearButton")
+  .addEventListener(
+    "click",
+    () => {
+
+      try{
+        localStorage.removeItem(
+          APP.storageKey
+        );
+      }catch{}
+
+      setMailbox(
+        generateLogin(),
+        APP.defaultDomain
+      );
+
+      showToast(
+        "Local mailbox state cleared."
+      );
+    }
+  );
+
+/* ==========================================================
+   BUTTON EVENTS
+========================================================== */
+
+$("copyButton")
+  .addEventListener(
+    "click",
+    copyEmail
+  );
+
+$("newEmailButton")
+  .addEventListener(
+    "click",
+    generateNewEmail
+  );
+
+$("refreshButton")
+  .addEventListener(
+    "click",
+    () => fetchInbox(true)
+  );
+
+$("refreshButton2")
+  .addEventListener(
+    "click",
+    () => fetchInbox(true)
+  );
+
+$("notifyButton")
+  .addEventListener(
+    "click",
+    requestNotifications
+  );
+
+$("notificationButton")
+  .addEventListener(
+    "click",
+    requestNotifications
+  );
+
+/* ==========================================================
+   VISIBILITY
+========================================================== */
+
+document.addEventListener(
+  "visibilitychange",
+  () => {
+
+    if(
+      document.hidden
+    ){
+
+      if(state.pollTimer){
+        clearInterval(
+          state.pollTimer
+        );
+        state.pollTimer = null;
+      }
+
+      if(state.countdownTimer){
+        clearInterval(
+          state.countdownTimer
+        );
+        state.countdownTimer = null;
+      }
+
+    }else{
+
+      restartPolling();
+
+      fetchInbox(false);
+    }
+  }
+);
+
+/* ==========================================================
+   HASH NAVIGATION
+========================================================== */
+
+window.addEventListener(
+  "hashchange",
+  () => {
+
+    const hash =
+      location.hash;
+
+    if(hash === "#inbox"){
+
+      $("inbox")
+        .scrollIntoView({
+          behavior:"smooth"
+        });
+
+    }else if(
+      hash === "#features"
+    ){
+
+      $("features")
+        .scrollIntoView({
+          behavior:"smooth"
+        });
+
+    }else if(
+      hash === "#mailbox"
+    ){
+
+      $("mailbox")
+        .scrollIntoView({
+          behavior:"smooth"
+        });
+    }
+  }
+);
+
+/* ==========================================================
+   BEFORE UNLOAD
+========================================================== */
+
+window.addEventListener(
+  "beforeunload",
+  () => {
+
+    if(state.pollTimer){
+      clearInterval(
+        state.pollTimer
+      );
+    }
+
+    if(state.countdownTimer){
+      clearInterval(
+        state.countdownTimer
+      );
+    }
+  }
+);
+
+/* ==========================================================
+   SERVICE WORKER
+========================================================== */
+
+if(
+  "serviceWorker" in navigator
+){
+
+  window.addEventListener(
+    "load",
+    () => {
+
+      navigator.serviceWorker
+        .register(
+          "/sw.js",
+          {
+            scope:"/"
+          }
+        )
+        .catch(
+          error =>
+            console.warn(
+              "Service worker registration failed:",
+              error
+            )
+        );
+    }
+  );
+}
+
+/* ==========================================================
+   INITIALIZATION
+========================================================== */
+
+async function init(){
+
+  const restored =
+    restoreState();
+
+  if(!restored){
+
+    state.login =
+      generateLogin();
+
+    state.domain =
+      APP.defaultDomain;
+
+    state.email =
+      buildEmail();
+
+    saveState();
+  }
+
+  state.email =
+    buildEmail();
+
+  updateEmailUI();
+
+  renderInbox();
+
+  restartPolling();
+
+  state.initialized =
+    true;
+
+  /*
+   * Run independently so a failure in ads
+   * never breaks mailbox initialization.
+   */
+  loadAds();
+
+  await fetchInbox(false);
+}
+
+init();
+
+</script>
+
+</body>
+</html>`;
+}
+
+// ============================================================
+// ROOT HANDLER
+// ============================================================
+
+async function handleRoot(request, env) {
+
+  let html = null;
+
+  try {
+
+    if (env.MY_KV) {
+
+      html = await env.MY_KV.get(
+        CONFIG.KV_HTML_KEY,
+        {
+          type: "text"
+        }
+      );
+    }
+
+  } catch (error) {
+
+    console.error(
+      "HTML_KV_READ_ERROR",
+      error
+    );
+  }
+
+  if (
+    typeof html !== "string" ||
+    !html.trim()
+  ) {
+
+    html =
+      getDefaultHTML();
+  }
+
+  return htmlResponse(html);
+}
+
+// ============================================================
+// OPTIONS
+// ============================================================
+
+function handleOptions() {
+
+  return new Response(null, {
+    status: 204,
+    headers: securityHeaders({
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods":
+        CONFIG.ALLOWED_METHODS.join(", "),
+      "Access-Control-Allow-Headers":
+        "Content-Type, Accept",
+      "Access-Control-Max-Age":
+        "86400"
+    })
+  });
+}
+
+// ============================================================
+// 404
+// ============================================================
+
+function notFound() {
+
+  return errorResponse(
+    404,
+    "NOT_FOUND",
+    "The requested route does not exist."
+  );
+}
+
+// ============================================================
+// METHOD GUARD
+// ============================================================
+
+function methodAllowed(method) {
+
+  return CONFIG.ALLOWED_METHODS
+    .includes(method);
+}
+
+// ============================================================
+// MAIN WORKER
+// ============================================================
+
 export default {
+
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/")) return handleApi(request, env, url);
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
-    return html(APP_HTML);
-  },
-  async scheduled(controller, env, ctx) {
-    if (!env.TTTMAIL_KV) return;
-    await env.TTTMAIL_KV.put("cleanup:lastRun", new Date().toISOString(), { expirationTtl: 86400 * 7 });
+
+    try {
+
+      const method =
+        request.method.toUpperCase();
+
+      if(
+        !methodAllowed(method)
+      ){
+
+        return errorResponse(
+          405,
+          "METHOD_NOT_ALLOWED",
+          "This HTTP method is not supported."
+        );
+      }
+
+      if(
+        method === "OPTIONS"
+      ){
+
+        return handleOptions();
+      }
+
+      const url =
+        new URL(request.url);
+
+      const pathname =
+        url.pathname;
+
+      if(
+        pathname === "/api/health"
+      ){
+
+        return handleHealth(env);
+      }
+
+      if(
+        pathname === "/api/ads"
+      ){
+
+        return handleAds(env);
+      }
+
+      if(
+        pathname === "/api/inbox"
+      ){
+
+        return handleInbox(url);
+      }
+
+      if(
+        pathname === "/api/message"
+      ){
+
+        return handleMessage(url);
+      }
+
+      if(
+        pathname === "/" ||
+        pathname === "/index.html"
+      ){
+
+        return handleRoot(
+          request,
+          env
+        );
+      }
+
+      return notFound();
+
+    } catch (error) {
+
+      console.error(
+        "TTTMAIL_WORKER_FATAL",
+        error
+      );
+
+      return errorResponse(
+        500,
+        "INTERNAL_SERVER_ERROR",
+        "An unexpected server error occurred."
+      );
+    }
   }
 };
